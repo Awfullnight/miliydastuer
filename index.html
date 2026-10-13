@@ -500,5 +500,102 @@ $('mc-signin').onclick = async () => {
   });
 })();
 </script>
+
+<script>
+/* Shared student list sync. Requires public.shared_app_state SQL setup and a signed-in curator. */
+(function () {
+  const STORAGE_KEY = 'counselor_students';
+  const CLOUD_KEY = 'counselor_students';
+  const MARKER_KEY = '__unipath_students_cloud_version';
+  let client = null;
+  let applyingCloud = false;
+  let saveTimer = null;
+  let channel = null;
+
+  function getClient() { return window.supabaseClient || null; }
+  function parseList(raw) { try { const v = JSON.parse(raw || '[]'); return Array.isArray(v) ? v : []; } catch (_) { return []; } }
+  function same(a,b) { try { return JSON.stringify(a) === JSON.stringify(b); } catch (_) { return false; } }
+
+  async function curatorSession() {
+    if (!client) return false;
+    const { data: authData, error: authError } = await client.auth.getSession();
+    if (authError || !authData.session) return false;
+    const uid = authData.session.user.id;
+    const { data, error } = await client.from('user_roles').select('role').eq('user_id', uid).eq('role', 'curator').maybeSingle();
+    if (error) { console.warn('[Shared students] Cannot verify curator role:', error.message); return false; }
+    return !!data;
+  }
+
+  async function saveToCloud(raw) {
+    if (applyingCloud || !client) return;
+    const students = parseList(raw);
+    try {
+      if (!(await curatorSession())) {
+        console.warn('[Shared students] Not saved to cloud: sign in with the curator account first.');
+        return;
+      }
+      const { error } = await client.from('shared_app_state').upsert({ key: CLOUD_KEY, value: students, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+      if (error) console.error('[Shared students] Cloud save failed:', error.message);
+    } catch (e) { console.error('[Shared students] Cloud save failed:', e); }
+  }
+
+  const originalSetItem = Storage.prototype.setItem;
+  Storage.prototype.setItem = function (key, value) {
+    originalSetItem.call(this, key, value);
+    if (this === window.localStorage && key === STORAGE_KEY && !applyingCloud) {
+      clearTimeout(saveTimer);
+      const raw = String(value);
+      saveTimer = setTimeout(() => saveToCloud(raw), 500);
+    }
+  };
+
+  async function init() {
+    // supabase.js is loaded immediately before this bridge.
+    for (let i = 0; i < 40 && !getClient(); i++) await new Promise(r => setTimeout(r, 150));
+    client = getClient();
+    if (!client) { console.error('[Shared students] Supabase client missing.'); return; }
+
+    const { data: row, error } = await client.from('shared_app_state').select('value,updated_at').eq('key', CLOUD_KEY).maybeSingle();
+    if (error) { console.error('[Shared students] Cloud read failed:', error.message); return; }
+
+    if (row && Array.isArray(row.value)) {
+      const current = parseList(localStorage.getItem(STORAGE_KEY));
+      const marker = row.updated_at || JSON.stringify(row.value).length.toString();
+      if (!same(current, row.value) && sessionStorage.getItem(MARKER_KEY) !== marker) {
+        applyingCloud = true;
+        originalSetItem.call(localStorage, STORAGE_KEY, JSON.stringify(row.value));
+        applyingCloud = false;
+        sessionStorage.setItem(MARKER_KEY, marker);
+        location.reload();
+        return;
+      }
+    } else {
+      // Seed only if there is no shared row yet, and only from an authorized curator.
+      const local = parseList(localStorage.getItem(STORAGE_KEY));
+      if (local.length && await curatorSession()) await saveToCloud(JSON.stringify(local));
+    }
+
+    try {
+      channel = client.channel('shared-student-list-sync')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'shared_app_state', filter: 'key=eq.' + CLOUD_KEY }, async payload => {
+          const next = payload.new && payload.new.value;
+          if (!Array.isArray(next)) return;
+          const current = parseList(localStorage.getItem(STORAGE_KEY));
+          if (same(current, next)) return;
+          applyingCloud = true;
+          originalSetItem.call(localStorage, STORAGE_KEY, JSON.stringify(next));
+          applyingCloud = false;
+          const version = payload.new.updated_at || JSON.stringify(next).length.toString();
+          sessionStorage.setItem(MARKER_KEY, version);
+          location.reload();
+        }).subscribe();
+    } catch (e) { console.warn('[Shared students] Realtime subscription failed:', e); }
+  }
+
+  window.addEventListener('beforeunload', () => { if (channel && client) client.removeChannel(channel); });
+  init();
+})();
+</script>
+
 </body>
 </html>
